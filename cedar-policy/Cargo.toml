@@ -25,11 +25,12 @@ dhat = { version = "0.3.2", optional = true}
 
 [features]
 # by default, enable all Cedar extensions, but not other crate features
-default = ["ipaddr", "decimal"]
+default = ["ipaddr", "decimal", "u256"]
 
 # Cedar extensions
 ipaddr = ["cedar-policy-core/ipaddr", "cedar-policy-validator/ipaddr"]
 decimal = ["cedar-policy-core/decimal", "cedar-policy-validator/decimal"]
+u256 = ["cedar-policy-core/u256", "cedar-policy-validator/u256"]
 
 # Features for memory or runtime profiling
 heap-profiling = ["dep:dhat"]

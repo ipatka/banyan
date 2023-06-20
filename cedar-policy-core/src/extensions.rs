@@ -23,6 +23,9 @@ pub mod ipaddr;
 pub mod decimal;
 pub mod partial_evaluation;
 
+#[cfg(feature = "u256")]
+pub mod u256;
+
 use crate::ast::{Extension, ExtensionFunction, Name};
 use crate::entities::SchemaType;
 use thiserror::Error;
@@ -34,6 +37,8 @@ lazy_static::lazy_static! {
         #[cfg(feature = "decimal")]
         decimal::extension(),
         partial_evaluation::extension(),
+        #[cfg(feature = "u256")]
+        u256::extension(),
     ];
 }
 

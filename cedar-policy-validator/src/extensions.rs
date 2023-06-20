@@ -24,7 +24,11 @@ pub mod ipaddr;
 #[cfg(feature = "decimal")]
 pub mod decimal;
 
+
 pub mod partial_evaluation;
+
+#[cfg(feature = "u256")]
+pub mod u256;
 
 /// Get schemas for all the available extensions.
 pub fn all_available_extension_schemas() -> Vec<ExtensionSchema> {
@@ -34,5 +38,7 @@ pub fn all_available_extension_schemas() -> Vec<ExtensionSchema> {
         #[cfg(feature = "decimal")]
         decimal::extension_schema(),
         partial_evaluation::extension_schema(),
+        #[cfg(feature = "u256")]
+        u256::extension_schema(),
     ]
 }

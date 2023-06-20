@@ -1,0 +1,7 @@
+permit(
+    principal,
+    action == Action::"view",
+    resource == Photo::"VacationPhoto94.jpg"
+) when {
+    context.eth_value.u256GreaterThan(u256("100000000000"))
+};

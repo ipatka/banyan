@@ -20,6 +20,7 @@
 
 mod corpus_tests;
 mod decimal;
+mod u256;
 mod example_use_cases_doc;
 mod ip;
 mod multi;

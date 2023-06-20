@@ -1,0 +1,50 @@
+{
+    "policies": "tests/u256/policies_2.txt",
+    "entities": "sample-data/sandbox_c/entities.json",
+    "schema": "sample-data/sandbox_c/schema_exts.json",
+    "should_validate": true,
+    "queries": [
+        {
+            "desc": "alice should be able to view the photo given a confidence score of 0.455",
+            "principal": "User::\"alice\"",
+            "action": "Action::\"view\"",
+            "resource": "Photo::\"VacationPhoto94.jpg\"",
+            "context": {
+                "eth_value": {"__expr" : "u256(\"4500\")"},
+                "source_ip": "123.123.123.123",
+                "authenticated": false
+            },
+            "decision": "Allow",
+            "reasons": ["policy0"],
+            "errors": []
+        },
+        {
+            "desc": "alice should not be allowed to view the photo when given a confidence score of 0.0001",
+            "principal": "User::\"alice\"",
+            "action": "Action::\"view\"",
+            "resource": "Photo::\"VacationPhoto94.jpg\"",
+            "context": {
+                "eth_value": {"__expr" : "u256(\"5001\")"},
+                "source_ip": "123.123.123.123",
+                "authenticated": true
+            },
+            "decision": "Deny",
+            "reasons": [],
+            "errors": []
+        },
+        {
+            "desc": "alice should not be allowed to view the photo when given a confidence score of 0.9",
+            "principal": "User::\"alice\"",
+            "action": "Action::\"view\"",
+            "resource": "Photo::\"VacationPhoto94.jpg\"",
+            "context": {
+                "eth_value": {"__expr" : "u256(\"0\")"},
+                "source_ip": "123.123.123.123",
+                "authenticated": true
+            },
+            "decision": "Deny",
+            "reasons": [],
+            "errors": []
+        }
+    ]
+}
