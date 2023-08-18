@@ -1,6 +1,8 @@
-# Cedar
+# Banyan
 
-![Cedar Logo](./logo.svg)
+![izkp_Banyan_tree_with_complex_network_of_roots_wrapped_around_b_0f90a1b0-b3d0-4fd7-bd33-f36c781f0632](https://github.com/ipatka/banyan/assets/4401444/34129c1d-d9d6-401a-8529-c48ae74d55d4)
+
+
 
 [![Crates.io](https://img.shields.io/crates/v/cedar-policy.svg)](https://crates.io/crates/cedar-policy)
 [![docs.rs](https://img.shields.io/docsrs/cedar-policy)](https://docs.rs/cedar-policy/latest/cedar_policy/)
@@ -101,9 +103,11 @@ To build, simply run `cargo build`.
 
 See [SECURITY](SECURITY.md) for more information.
 
-## Contributing
+## Attribution
 
-We welcome contributions from the community. Please either file an issue, or see [CONTRIBUTING](CONTRIBUTING.md)
+Banyan is based on a fork of [Cedar](https://github.com/cedar-policy/cedar)
+
+![Cedar Logo](./logo.svg)
 
 ## License
 
