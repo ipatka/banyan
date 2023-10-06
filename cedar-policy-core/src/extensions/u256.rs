@@ -29,7 +29,6 @@ use thiserror::Error;
 
 use ethers::prelude::U256;
 
-
 /// UINT256 value, represented internally as an integer.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 struct UINT256 {
@@ -65,7 +64,6 @@ enum Error {
     Overflow,
 }
 
-
 impl UINT256 {
     /// The Cedar typename of u256 values
     fn typename() -> Name {
@@ -88,7 +86,7 @@ impl UINT256 {
 
         let l = U256::from_dec_str(str.as_ref()).map_err(|_| Error::Overflow)?;
 
-         Ok(Self { value: l })
+        Ok(Self { value: l })
         // l.map(|value| Self { value })
         // .ok_or(Error::Overflow)
     }
@@ -96,11 +94,7 @@ impl UINT256 {
 
 impl std::fmt::Display for UINT256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.value
-        )
+        write!(f, "{}", self.value)
     }
 }
 
@@ -113,11 +107,18 @@ impl ExtensionValue for UINT256 {
 const EXTENSION_NAME: &str = "u256";
 
 fn extension_err(msg: impl Into<String>) -> evaluator::EvaluationError {
-    evaluator::EvaluationError::ExtensionError {
-        extension_name: names::UINT256_FROM_STR_NAME.clone(),
-        msg: msg.into(),
-    }
+    evaluator::EvaluationError::failed_extension_function_application(
+        names::UINT256_FROM_STR_NAME.clone(),
+        msg.into(),
+    )
 }
+
+// fn extension_err(msg: impl Into<String>) -> evaluator::EvaluationError {
+//     evaluator::EvaluationError::ExtensionError {
+//         extension_name: names::UINT256_FROM_STR_NAME.clone(),
+//         msg: String::from(msg),
+//     }
+// }
 
 /// Cedar function that constructs a `u256` Cedar type from a
 /// Cedar string
@@ -128,7 +129,6 @@ fn uint256_from_str(arg: Value) -> evaluator::Result<ExtensionOutputValue> {
     let e = ExtensionValueWithArgs::new(Arc::new(u256), vec![arg.into()], function_name);
     Ok(Value::ExtensionValue(Arc::new(e)).into())
 }
-
 
 /// Cedar function that tests whether the first `u256` Cedar type is
 /// less than the second `u256` Cedar type, returning a Cedar bool
@@ -213,17 +213,19 @@ mod tests {
     /// Asserts that a `Result` is an `Err::ExtensionErr` with our extension name
     fn assert_uint256_err<T>(res: evaluator::Result<T>) {
         match res {
-            Err(evaluator::EvaluationError::ExtensionError {
-                extension_name,
-                msg,
-            }) => {
-                println!("{msg}");
-                assert_eq!(
+            Err(e) => match e.error_kind() {
+                evaluator::EvaluationErrorKind::FailedExtensionFunctionApplication {
                     extension_name,
-                    Name::parse_unqualified_name("u256").expect("should be a valid identifier")
-                )
-            }
-            Err(e) => panic!("Expected an u256 ExtensionErr, got {:?}", e),
+                    msg,
+                } => {
+                    println!("{msg}");
+                    assert_eq!(
+                        *extension_name,
+                        Name::parse_unqualified_name("u256").expect("should be a valid identifier")
+                    )
+                }
+                _ => panic!("Expected an u256 ExtensionErr, got {:?}", e),
+            },
             Ok(_) => panic!("Expected an u256 ExtensionErr, got Ok"),
         }
     }
@@ -244,14 +246,13 @@ mod tests {
     fn constructors() {
         let ext = extension();
         assert!(ext
-            .get_func(
-                &Name::parse_unqualified_name("u256").expect("should be a valid identifier")
-            )
+            .get_func(&Name::parse_unqualified_name("u256").expect("should be a valid identifier"))
             .expect("function should exist")
             .is_constructor());
         assert!(!ext
             .get_func(
-                &Name::parse_unqualified_name("u256LessThan").expect("should be a valid identifier")
+                &Name::parse_unqualified_name("u256LessThan")
+                    .expect("should be a valid identifier")
             )
             .expect("function should exist")
             .is_constructor());
@@ -264,7 +265,8 @@ mod tests {
             .is_constructor());
         assert!(!ext
             .get_func(
-                &Name::parse_unqualified_name("u256GreaterThan").expect("should be a valid identifier")
+                &Name::parse_unqualified_name("u256GreaterThan")
+                    .expect("should be a valid identifier")
             )
             .expect("function should exist")
             .is_constructor());
@@ -293,14 +295,10 @@ mod tests {
             eval.interpret_inline_policy(&parse_expr(r#"u256("0")"#).expect("parsing error")),
         );
         assert_uint256_valid(
-            eval.interpret_inline_policy(
-                &parse_expr(r#"u256("123456")"#).expect("parsing error"),
-            ),
+            eval.interpret_inline_policy(&parse_expr(r#"u256("123456")"#).expect("parsing error")),
         );
         assert_uint256_valid(
-            eval.interpret_inline_policy(
-                &parse_expr(r#"u256("1234")"#).expect("parsing error"),
-            ),
+            eval.interpret_inline_policy(&parse_expr(r#"u256("1234")"#).expect("parsing error")),
         );
 
         // invalid u256 strings
@@ -322,7 +320,6 @@ mod tests {
         assert_uint256_err(
             eval.interpret_inline_policy(&parse_expr(r#"u256("-.")"#).expect("parsing error")),
         );
-
 
         // bad use of `u256` as method
         parse_expr(r#" "1.0".u256() "#).expect_err("should fail");
@@ -425,8 +422,8 @@ mod tests {
 
         // tests for u256LessThanOrEqual
         let tests = vec![
-            ((a.clone(), b.clone()), true),  // 123 <= 124
-            ((a.clone(), a.clone()), true),  // 123 <= 123
+            ((a.clone(), b.clone()), true), // 123 <= 124
+            ((a.clone(), a.clone()), true), // 123 <= 123
         ];
         uint256_ops_helper("u256LessThanOrEqual", tests);
 
@@ -456,13 +453,13 @@ mod tests {
             eval.interpret_inline_policy(
                 &parse_expr(r#"u256("123") < u256("124")"#).expect("parsing error")
             ),
-            Err(evaluator::EvaluationError::TypeError {
-                expected: vec![Type::Long],
-                actual: Type::Extension {
+            Err(evaluator::EvaluationError::type_error(
+                vec![Type::Long],
+                Type::Extension {
                     name: Name::parse_unqualified_name("u256")
                         .expect("should be a valid identifier")
                 },
-            })
+            ))
         );
     }
 

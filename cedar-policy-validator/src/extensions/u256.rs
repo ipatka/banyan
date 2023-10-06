@@ -16,10 +16,10 @@
 
 use crate::extension_schema::{ArgumentCheckFn, ExtensionFunctionType, ExtensionSchema};
 use crate::types::{self, Type};
-use cedar_policy_core::ast::{Expr, ExprKind, Literal};
+use cedar_policy_core::ast::{Expr, ExprKind, Literal, RestrictedExpr};
 use cedar_policy_core::evaluator::RestrictedEvaluator;
 use cedar_policy_core::extensions::{u256, Extensions};
-use cedar_policy_core::parser::parse_restrictedexpr;
+use std::str::FromStr;
 
 /// If any of the panics in this file are triggered, that means that this file has become
 /// out-of-date with the u256 extension definition in CedarCore.
@@ -85,10 +85,12 @@ fn validate_u256_string(exprs: &[Expr]) -> Result<(), String> {
         Some(arg) if matches!(arg.expr_kind(), ExprKind::Lit(Literal::String(_))) => {
             let exts = Extensions::all_available();
             let evaluator = RestrictedEvaluator::new(&exts);
-            let expr = parse_restrictedexpr(&format!("u256({arg})")).expect("parsing error");
-            match evaluator.interpret(expr.as_borrowed()) {
-                Ok(_) => Ok(()),
-                Err(_) => Err(format!("Failed to parse as a u256 value: {arg}")),
+            match RestrictedExpr::from_str(&format!("u256({arg})")) {
+                Ok(expr) => match evaluator.interpret(expr.as_borrowed()) {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err(format!("Failed to parse as a u256 value: `{arg}`")),
+                },
+                Err(_) => Err(format!("Failed to parse as a u256 value: `{arg}`")),
             }
         }
         _ => Ok(()),
