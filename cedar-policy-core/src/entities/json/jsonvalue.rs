@@ -21,7 +21,9 @@ use super::{
 use crate::ast::{
     BorrowedRestrictedExpr, Eid, EntityUID, Expr, ExprKind, Literal, Name, RestrictedExpr,
 };
-use crate::extensions::{Extensions, ExtensionsError};
+use crate::entities::EscapeKind;
+use crate::extensions::{ExtensionFunctionLookupError, Extensions};
+use crate::FromNormalizedStr;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
@@ -124,11 +126,11 @@ impl From<&EntityUID> for TypeAndId {
 }
 
 impl TryFrom<TypeAndId> for EntityUID {
-    type Error = Vec<crate::parser::err::ParseError>;
+    type Error = crate::parser::err::ParseErrors;
 
     fn try_from(e: TypeAndId) -> Result<EntityUID, Self::Error> {
         Ok(EntityUID::from_components(
-            e.entity_type.parse()?,
+            Name::from_normalized_str(&e.entity_type)?,
             Eid::new(e.id),
         ))
     }
@@ -171,32 +173,24 @@ impl JSONValue {
             Self::ExprEscape { __expr: expr } => {
                 use crate::parser;
                 let expr: Expr = parser::parse_expr(&expr).map_err(|errs| {
-                    JsonDeserializationError::ExprParseError(parser::err::ParseError::WithContext {
-                        context: format!(
-                            "contents of __expr escape {} are not a valid Cedar expression",
-                            expr
-                        ),
+                    JsonDeserializationError::ParseEscape {
+                        kind: EscapeKind::Expr,
+                        value: expr.to_string(),
                         errs,
-                    })
+                    }
                 })?;
                 Ok(RestrictedExpr::new(expr)?)
             }
-            Self::EntityEscape { __entity: entity } => {
-                use crate::parser;
-                Ok(RestrictedExpr::val(
-                    EntityUID::try_from(entity.clone()).map_err(|errs| {
-                        JsonDeserializationError::EntityParseError(
-                            parser::err::ParseError::WithContext {
-                                context: format!(
-                                    "contents of __entity escape {} do not make a valid entity reference",
-                                    serde_json::to_string_pretty(&entity).unwrap_or_else(|_| format!("{:?}", &entity))
-                                ),
-                                errs,
-                            },
-                        )
-                    })?,
-                ))
-            }
+            Self::EntityEscape { __entity: entity } => Ok(RestrictedExpr::val(
+                EntityUID::try_from(entity.clone()).map_err(|errs| {
+                    JsonDeserializationError::ParseEscape {
+                        kind: EscapeKind::Entity,
+                        value: serde_json::to_string_pretty(&entity)
+                            .unwrap_or_else(|_| format!("{:?}", &entity)),
+                        errs,
+                    }
+                })?,
+            )),
             Self::ExtnEscape { __extn: extn } => extn.into_expr(),
         }
     }
@@ -287,16 +281,13 @@ impl JSONValue {
 impl FnAndArg {
     /// Convert this `FnAndArg` into a Cedar "restricted expression" (which will be a call to an extension constructor)
     pub fn into_expr(self) -> Result<RestrictedExpr, JsonDeserializationError> {
-        use crate::parser;
         Ok(RestrictedExpr::call_extension_fn(
-            self.ext_fn.parse().map_err(|errs| {
-                JsonDeserializationError::ExtnParseError(parser::err::ParseError::WithContext {
-                    context: format!(
-                        "in __extn escape, {:?} is not a valid function name",
-                        &self.ext_fn,
-                    ),
+            Name::from_normalized_str(&self.ext_fn).map_err(|errs| {
+                JsonDeserializationError::ParseEscape {
+                    kind: EscapeKind::Extension,
+                    value: self.ext_fn.to_string(),
                     errs,
-                })
+                }
             })?,
             vec![JSONValue::into_expr(*self.arg)?],
         ))
@@ -470,7 +461,7 @@ impl<'e> ValueParser<'e> {
                         },
                         &argty,
                     )?
-                    .ok_or_else(|| JsonDeserializationError::ImpliedConstructorNotFound {
+                    .ok_or_else(|| JsonDeserializationError::MissingImpliedConstructor {
                         ctx: Box::new(ctx()),
                         return_type: Box::new(SchemaType::Extension {
                             name: expected_typename,
@@ -539,7 +530,7 @@ impl<'e> ValueParser<'e> {
             }
             ExprKind::ExtensionFunctionApp { fn_name, .. } => {
                 let efunc = self.extensions.func(fn_name)?;
-                Ok(efunc.return_type().cloned().ok_or_else(|| ExtensionsError::HasNoType {
+                Ok(efunc.return_type().cloned().ok_or_else(|| ExtensionFunctionLookupError::HasNoType {
                     name: efunc.name().clone()
                 })?)
             }

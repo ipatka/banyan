@@ -15,8 +15,9 @@
  */
 
 use crate::ast::*;
-use crate::parser::err::ParseError;
+use crate::parser::err::ParseErrors;
 use crate::transitive_closure::TCNode;
+use crate::FromNormalizedStr;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -103,7 +104,7 @@ impl EntityUID {
     // GRCOV_BEGIN_COVERAGE
 
     /// Create an `EntityUID` with the given (unqualified) typename, and the given string as its EID.
-    pub fn with_eid_and_type(typename: &str, eid: &str) -> Result<Self, Vec<ParseError>> {
+    pub fn with_eid_and_type(typename: &str, eid: &str) -> Result<Self, ParseErrors> {
         Ok(Self {
             ty: EntityType::Concrete(Name::parse_unqualified_name(typename)?),
             eid: Eid(eid.into()),
@@ -156,10 +157,16 @@ impl std::fmt::Display for EntityUID {
 
 // allow `.parse()` on a string to make an `EntityUID`
 impl std::str::FromStr for EntityUID {
-    type Err = Vec<ParseError>;
+    type Err = ParseErrors;
 
-    fn from_str(s: &str) -> Result<Self, Vec<ParseError>> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         crate::parser::parse_euid(s)
+    }
+}
+
+impl FromNormalizedStr for EntityUID {
+    fn describe_self() -> &'static str {
+        "Entity UID"
     }
 }
 
@@ -251,6 +258,13 @@ impl Entity {
         self.ancestors.iter()
     }
 
+    /// Iterate over this entity's attributes
+    pub fn attrs(&self) -> impl Iterator<Item = (&str, BorrowedRestrictedExpr<'_>)> {
+        self.attrs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_borrowed()))
+    }
+
     /// Create an `Entity` with the given UID, no attributes, and no parents.
     pub fn with_uid(uid: EntityUID) -> Self {
         Self {
@@ -262,7 +276,7 @@ impl Entity {
 
     /// Read-only access the internal `attrs` map of String to RestrictedExpr.
     /// This function is available only inside Core.
-    pub(crate) fn attrs(&self) -> &HashMap<SmolStr, RestrictedExpr> {
+    pub(crate) fn attrs_map(&self) -> &HashMap<SmolStr, RestrictedExpr> {
         &self.attrs
     }
 

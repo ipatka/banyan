@@ -17,8 +17,12 @@
 //! This module contains the `Entities` type and related functionality.
 
 use crate::ast::*;
+use crate::evaluator::{EvaluationError, RestrictedEvaluator};
+use crate::extensions::Extensions;
 use crate::transitive_closure::{compute_tc, enforce_tc_and_dag};
+use std::borrow::Cow;
 use std::collections::{hash_map, HashMap};
+use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -27,6 +31,7 @@ mod err;
 pub use err::*;
 mod json;
 pub use json::*;
+use smol_str::SmolStr;
 
 /// Represents an entity hierarchy, and allows looking up `Entity` objects by
 /// UID.
@@ -47,6 +52,9 @@ pub struct Entities {
     #[serde_as(as = "Vec<(_, _)>")]
     entities: HashMap<EntityUID, Entity>,
 
+    #[serde(skip)]
+    evaluated_entities: Option<EvaluatedEntities>,
+
     /// The mode flag determines whether this store functions as a partial store or
     /// as a fully concrete store.
     /// Mode::Concrete means that the store is fully concrete, and failed dereferences are an error.
@@ -63,16 +71,19 @@ impl Entities {
         Self {
             entities: HashMap::new(),
             mode: Mode::default(),
+            evaluated_entities: None,
         }
     }
 
     /// Transform the store into a partial store, where
     /// attempting to dereference a non-existent EntityUID results in
     /// a residual instead of an error.
+    #[cfg(feature = "partial-eval")]
     pub fn partial(self) -> Self {
         Self {
             entities: self.entities,
             mode: Mode::Partial,
+            evaluated_entities: self.evaluated_entities,
         }
     }
 
@@ -82,6 +93,7 @@ impl Entities {
             Some(e) => Dereference::Data(e),
             None => match self.mode {
                 Mode::Concrete => Dereference::NoSuchEntity,
+                #[cfg(feature = "partial-eval")]
                 Mode::Partial => Dereference::Residual(Expr::unknown(format!("{uid}"))),
             },
         }
@@ -90,6 +102,36 @@ impl Entities {
     /// Iterate over the `Entity`s in the `Entities`
     pub fn iter(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values()
+    }
+
+    /// Adds the [`crate::ast::Entity`]s in the iterator to this [`Entities`].
+    /// Fails if the passed iterator contains any duplicate entities with this structure,
+    /// or if any error is encountered in the transitive closure computation.
+    ///
+    /// If you pass [`TCComputation::AssumeAlreadyComputed`], then the caller is
+    /// responsible for ensuring that TC and DAG hold before calling this method.
+    pub fn add_entities(
+        mut self,
+        collection: impl IntoIterator<Item = Entity>,
+        mode: TCComputation,
+    ) -> Result<Self> {
+        for entity in collection.into_iter() {
+            match self.entities.entry(entity.uid()) {
+                hash_map::Entry::Occupied(_) => return Err(EntitiesError::Duplicate(entity.uid())),
+                hash_map::Entry::Vacant(vacant_entry) => {
+                    vacant_entry.insert(entity);
+                }
+            }
+        }
+        match mode {
+            TCComputation::AssumeAlreadyComputed => (),
+            TCComputation::EnforceAlreadyComputed => {
+                enforce_tc_and_dag(&self.entities).map_err(Box::new)?
+            }
+            TCComputation::ComputeNow => compute_tc(&mut self.entities, true).map_err(Box::new)?,
+        };
+        self.evaluated_entities = None;
+        Ok(self)
     }
 
     /// Create an `Entities` object with the given entities.
@@ -113,6 +155,7 @@ impl Entities {
         Ok(Self {
             entities: entity_map,
             mode: Mode::default(),
+            evaluated_entities: None,
         })
     }
 
@@ -149,6 +192,167 @@ impl Entities {
             .map(EntityJSON::from_entity)
             .collect::<std::result::Result<_, JsonSerializationError>>()
             .map_err(Into::into)
+    }
+
+    fn get_entities_by_entity_type(&self) -> HashMap<EntityType, Vec<&Entity>> {
+        let mut entities_by_type: HashMap<EntityType, Vec<&Entity>> = HashMap::new();
+        for entity in self.iter() {
+            let euid = entity.uid();
+            let entity_type = euid.entity_type();
+            if let Some(entities) = entities_by_type.get_mut(entity_type) {
+                entities.push(entity);
+            } else {
+                entities_by_type.insert(entity_type.clone(), Vec::from([entity]));
+            }
+        }
+        entities_by_type
+    }
+
+    /// Write entities into a DOT graph
+    pub fn to_dot_str(&self) -> std::result::Result<String, std::fmt::Error> {
+        let mut dot_str = String::new();
+        // write prelude
+        dot_str.write_str("strict digraph {\n\tordering=\"out\"\n\tnode[shape=box]\n")?;
+
+        // From DOT language reference:
+        // An ID is one of the following:
+        // Any string of alphabetic ([a-zA-Z\200-\377]) characters, underscores ('_') or digits([0-9]), not beginning with a digit;
+        // a numeral [-]?(.[0-9]⁺ | [0-9]⁺(.[0-9]*)? );
+        // any double-quoted string ("...") possibly containing escaped quotes (\")¹;
+        // an HTML string (<...>).
+        // The best option to convert a `Name` or an `EntityUid` is to use double-quoted string.
+        // The `escape_debug` method should be sufficient for our purpose.
+        fn to_dot_id(v: &impl std::fmt::Display) -> String {
+            format!("\"{}\"", v.to_string().escape_debug())
+        }
+
+        // write clusters (subgraphs)
+        let entities_by_type = self.get_entities_by_entity_type();
+
+        for (et, entities) in entities_by_type {
+            dot_str.write_str(&format!(
+                "\tsubgraph \"cluster_{et}\" {{\n\t\tlabel={}\n",
+                to_dot_id(&et)
+            ))?;
+            for entity in entities {
+                let euid = to_dot_id(&entity.uid());
+                let label = format!(r#"[label={}]"#, to_dot_id(&entity.uid().eid()));
+                dot_str.write_str(&format!("\t\t{euid} {label}\n"))?;
+            }
+            dot_str.write_str("\t}\n")?;
+        }
+
+        // adding edges
+        for entity in self.iter() {
+            for ancestor in entity.ancestors() {
+                dot_str.write_str(&format!(
+                    "\t{} -> {}\n",
+                    to_dot_id(&entity.uid()),
+                    to_dot_id(&ancestor)
+                ))?;
+            }
+        }
+
+        dot_str.write_str("}\n")?;
+        Ok(dot_str)
+    }
+
+    /// Attempt to eagerly compute the values of attributes for all entities in the slice.
+    /// This can fail if evaluation of the [`RestrictedExpr`] fails.
+    /// In a future major version, we will likely make this function automatically called via the constructor.
+    pub fn evaluate(self) -> std::result::Result<Self, EvaluationError> {
+        if self.evaluated_entities.is_some() {
+            Ok(self)
+        } else {
+            let r = self.compute_entities_values()?;
+            Ok(Self {
+                entities: self.entities,
+                evaluated_entities: Some(r),
+                mode: self.mode,
+            })
+        }
+    }
+
+    fn compute_entities_values(&self) -> std::result::Result<EvaluatedEntities, EvaluationError> {
+        build_evaluated_entities(self, &Extensions::all_available())
+    }
+
+    /// Extracts the [`EntityAttrValues`] for this entity slice.
+    /// If the entity values have already been computed via [`Self::evaluate`], then that will be re-used.
+    /// Otherwise, the attributes will be evaluated.
+    pub fn get_attr_values(&self) -> std::result::Result<EntityAttrValues<'_>, EvaluationError> {
+        let map = match &self.evaluated_entities {
+            Some(cached) => Cow::Borrowed(cached),
+            None => Cow::Owned(self.compute_entities_values()?),
+        };
+        Ok(EntityAttrValues::new(map, self))
+    }
+}
+
+type EvaluatedEntities = HashMap<EntityUID, HashMap<SmolStr, PartialValue>>;
+
+/// Structure of borrowed entity information that is used in the evaluator
+#[derive(Debug)]
+pub struct EntityAttrValues<'a> {
+    /// The evaluated entity attributes. The attributes may either be owner or borrowed.
+    attrs: Cow<'a, EvaluatedEntities>,
+    /// The original entity slice, which contains hierarchy information.
+    entities: &'a Entities,
+}
+
+fn build_evaluated_entities(
+    entities: &Entities,
+    extensions: &'_ Extensions<'_>,
+) -> std::result::Result<EvaluatedEntities, EvaluationError> {
+    let restricted_eval = RestrictedEvaluator::new(extensions);
+    // Eagerly evaluate each attribute expression in the entities.
+    let attrs =
+        entities
+            .iter()
+            .map(|entity| {
+                Ok(
+                        (
+                            entity.uid(),
+                            entity
+                                .attrs_map()
+                                .iter()
+                                .map(|(attr, v)| {
+                                    Ok((
+                                        attr.to_owned(),
+                                        restricted_eval.partial_interpret(v.as_borrowed())?,
+                                    ))
+                                })
+                                .collect::<std::result::Result<
+                                    HashMap<SmolStr, PartialValue>,
+                                    EvaluationError,
+                                >>()?,
+                        ),
+                    )
+            })
+            .collect::<std::result::Result<
+                HashMap<EntityUID, HashMap<SmolStr, PartialValue>>,
+                EvaluationError,
+            >>()?;
+    Ok(attrs)
+}
+
+impl<'a> EntityAttrValues<'a> {
+    /// Construct an [`EntityAttrValues`] with either an owned or borrowed set of evaluated attributes.
+    pub fn new(attrs: Cow<'a, EvaluatedEntities>, entities: &'a Entities) -> Self {
+        Self { attrs, entities }
+    }
+
+    /// Get an entity's attribute map by its EntityUID.
+    pub fn get(&self, uid: &EntityUID) -> Dereference<'_, HashMap<SmolStr, PartialValue>> {
+        match self.entities.entity(uid) {
+            Dereference::NoSuchEntity => Dereference::NoSuchEntity,
+            Dereference::Residual(r) => Dereference::Residual(r),
+            Dereference::Data(_) => self
+                .attrs
+                .get(uid)
+                .map(Dereference::Data)
+                .unwrap_or_else(|| Dereference::NoSuchEntity),
+        }
     }
 }
 
@@ -226,6 +430,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Concrete,
+    #[cfg(feature = "partial-eval")]
     Partial,
 }
 
@@ -256,8 +461,272 @@ pub enum TCComputation {
 #[cfg(test)]
 mod json_parsing_tests {
     use super::*;
-    use crate::extensions::Extensions;
+    use crate::{extensions::Extensions, transitive_closure::TcError};
 
+    #[test]
+    fn enforces_tc_fail_cycle_almost() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"george\""}, "attrs" : { "foo" : 3 }, "parents" : ["Test::\"george\"", "Test::\"janet\""]}]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let es = es
+            .add_entities(stream, TCComputation::EnforceAlreadyComputed)
+            .err()
+            .unwrap();
+        // Despite this being a cycle, alice doesn't have the appropriate edges to form the cycle, so we get this error
+        let expected = TcError::MissingTcEdge {
+            child: r#"Test::"janet""#.parse().unwrap(),
+            parent: r#"Test::"george""#.parse().unwrap(),
+            grandparent: r#"Test::"janet""#.parse().unwrap(),
+        };
+        match es {
+            EntitiesError::TransitiveClosureError(e) => assert_eq!(&expected, e.as_ref()),
+            e => panic!("Wrong error: {e}"),
+        }
+    }
+
+    #[test]
+    fn enforces_tc_fail_connecting() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"george\""}, "attrs" : { "foo" : 3 }, "parents" : ["Test::\"henry\""]}]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let es = es
+            .add_entities(stream, TCComputation::EnforceAlreadyComputed)
+            .err()
+            .unwrap();
+        let expected = TcError::MissingTcEdge {
+            child: r#"Test::"janet""#.parse().unwrap(),
+            parent: r#"Test::"george""#.parse().unwrap(),
+            grandparent: r#"Test::"henry""#.parse().unwrap(),
+        };
+        match es {
+            EntitiesError::TransitiveClosureError(e) => assert_eq!(&expected, e.as_ref()),
+            e => panic!("Wrong error: {e}"),
+        }
+    }
+
+    #[test]
+    fn enforces_tc_fail_missing_edge() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"jeff\""}, "attrs" : { "foo" : 3 }, "parents" : ["Test::\"alice\""]}]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let es = es
+            .add_entities(stream, TCComputation::EnforceAlreadyComputed)
+            .err()
+            .unwrap();
+        let expected = TcError::MissingTcEdge {
+            child: r#"Test::"jeff""#.parse().unwrap(),
+            parent: r#"Test::"alice""#.parse().unwrap(),
+            grandparent: r#"Test::"bob""#.parse().unwrap(),
+        };
+        match es {
+            EntitiesError::TransitiveClosureError(e) => assert_eq!(&expected, e.as_ref()),
+            e => panic!("Wrong error: {e}"),
+        }
+    }
+
+    #[test]
+    fn enforces_tc_success() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"jeff\""}, "attrs" : { "foo" : 3 }, "parents" : ["Test::\"alice\"", "Test::\"bob\""]}]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let es = es
+            .add_entities(stream, TCComputation::EnforceAlreadyComputed)
+            .unwrap();
+        let euid = r#"Test::"jeff""#.parse().unwrap();
+        let jeff = es.entity(&euid).unwrap();
+        assert!(jeff.is_descendant_of(&r#"Test::"alice""#.parse().unwrap()));
+        assert!(jeff.is_descendant_of(&r#"Test::"bob""#.parse().unwrap()));
+        assert!(!jeff.is_descendant_of(&r#"Test::"george""#.parse().unwrap()));
+        simple_entities_still_sane(&es);
+    }
+
+    #[test]
+    fn adds_extends_tc_connecting() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"george\""}, "attrs" : { "foo" : 3 }, "parents" : ["Test::\"henry\""] }]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let es = es.add_entities(stream, TCComputation::ComputeNow).unwrap();
+        let euid = r#"Test::"george""#.parse().unwrap();
+        let jeff = es.entity(&euid).unwrap();
+        assert!(jeff.is_descendant_of(&r#"Test::"henry""#.parse().unwrap()));
+        let alice = es.entity(&r#"Test::"janet""#.parse().unwrap()).unwrap();
+        assert!(alice.is_descendant_of(&r#"Test::"henry""#.parse().unwrap()));
+        simple_entities_still_sane(&es);
+    }
+
+    #[test]
+    fn adds_extends_tc() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"jeff\""}, "attrs" : { "foo" : 3 }, "parents" : ["Test::\"alice\""]}]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let es = es.add_entities(stream, TCComputation::ComputeNow).unwrap();
+        let euid = r#"Test::"jeff""#.parse().unwrap();
+        let jeff = es.entity(&euid).unwrap();
+        assert!(jeff.is_descendant_of(&r#"Test::"alice""#.parse().unwrap()));
+        assert!(jeff.is_descendant_of(&r#"Test::"bob""#.parse().unwrap()));
+        simple_entities_still_sane(&es);
+    }
+
+    #[test]
+    fn adds_works() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"jeff\""}, "attrs" : { "foo" : 3 }, "parents" : ["Test::\"susan\""]}]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let es = es.add_entities(stream, TCComputation::ComputeNow).unwrap();
+        let euid = r#"Test::"jeff""#.parse().unwrap();
+        let jeff = es.entity(&euid).unwrap();
+        let rexpr = jeff.get("foo").unwrap();
+        let expected_rexpr = RestrictedExpr::new(Expr::val(3)).unwrap();
+        assert_eq!(rexpr, &expected_rexpr);
+        assert!(jeff.is_descendant_of(&r#"Test::"susan""#.parse().unwrap()));
+        simple_entities_still_sane(&es);
+    }
+
+    #[test]
+    fn add_duplicates_fail2() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new = serde_json::json!([
+            {"uid":{"__expr":"Test::\"jeff\""}, "attrs" : {}, "parents" : []},
+            {"uid":{"__expr":"Test::\"jeff\""}, "attrs" : {}, "parents" : []}]);
+
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let err = es
+            .add_entities(stream, TCComputation::ComputeNow)
+            .err()
+            .unwrap();
+        let expected = r#"Test::"jeff""#.parse().unwrap();
+        match err {
+            EntitiesError::Duplicate(e) => assert_eq!(e, expected),
+            e => panic!("Wrong error: {e}"),
+        }
+    }
+
+    #[test]
+    fn add_duplicates_fail1() {
+        let parser: EntityJsonParser<'_> =
+            EntityJsonParser::new(None, Extensions::all_available(), TCComputation::ComputeNow);
+        let new =
+            serde_json::json!([{"uid":{"__expr":"Test::\"alice\""}, "attrs" : {}, "parents" : []}]);
+        let stream = parser
+            .iter_from_json_value(new)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let es = simple_entities(&parser);
+        let err = es
+            .add_entities(stream, TCComputation::ComputeNow)
+            .err()
+            .unwrap();
+        let expected = r#"Test::"alice""#.parse().unwrap();
+        match err {
+            EntitiesError::Duplicate(e) => assert_eq!(e, expected),
+            e => panic!("Wrong error: {e}"),
+        }
+    }
+
+    fn simple_entities(parser: &EntityJsonParser<'_>) -> Entities {
+        let json = serde_json::json!(
+            [
+                {
+                    "uid" : { "__expr" : "Test::\"alice\"" },
+                    "attrs" : { "bar" : 2},
+                    "parents" : ["Test::\"bob\""]
+                },
+                {
+                    "uid" : { "__expr" : "Test::\"janet\"" },
+                    "attrs" : { "bar" : 2},
+                    "parents" : ["Test::\"george\""]
+                },
+                {
+                    "uid" : { "__expr" : "Test::\"bob\"" },
+                    "attrs" : {},
+                    "parents" : []
+                },
+                {
+                    "uid" : { "__expr" : "Test::\"henry\"" },
+                    "attrs" : {},
+                    "parents" : []
+                },
+            ]
+        );
+        parser.from_json_value(json).expect("JSON is correct")
+    }
+
+    /// Ensure the initial conditions of the entiites still hold
+    fn simple_entities_still_sane(e: &Entities) {
+        let bob = r#"Test::"bob""#.parse().unwrap();
+        let alice = e.entity(&r#"Test::"alice""#.parse().unwrap()).unwrap();
+        let bar = alice.get("bar").unwrap();
+        let two = RestrictedExpr::new(Expr::val(2)).unwrap();
+        assert_eq!(bar, &two);
+        assert!(alice.is_descendant_of(&bob));
+        let bob = e.entity(&bob).unwrap();
+        assert!(bob.ancestors().collect::<Vec<_>>().is_empty());
+    }
+
+    #[cfg(feature = "partial-eval")]
     #[test]
     fn basic_partial() {
         // Alice -> Jane -> Bob
@@ -348,6 +817,7 @@ mod json_parsing_tests {
         )
     }
 
+    #[cfg(feature = "ipaddr")]
     /// this one uses `__expr`, `__entity`, and `__extn` escapes, in various positions
     #[test]
     fn more_escapes() {
@@ -502,10 +972,10 @@ mod json_parsing_tests {
             .from_json_value(json)
             .expect_err("should be an invalid uid field");
         match err {
-            EntitiesError::DeserializationError(err) => {
+            EntitiesError::Deserialization(err) => {
                 assert!(
                     err.to_string().contains(
-                        "In uid field of <unknown entity>, expected a literal entity reference, but got \"hello\""
+                        r#"in uid field of <unknown entity>, expected a literal entity reference, but got `"hello"`"#
                     ),
                     "actual error message was {}",
                     err
@@ -527,9 +997,9 @@ mod json_parsing_tests {
             .from_json_value(json)
             .expect_err("should be an invalid uid field");
         match err {
-            EntitiesError::DeserializationError(err) => assert!(
+            EntitiesError::Deserialization(err) => assert!(
                 err.to_string()
-                    .contains("expected a literal entity reference, but got \"hello\""),
+                    .contains(r#"expected a literal entity reference, but got `"hello"`"#),
                 "actual error message was {}",
                 err
             ),
@@ -549,7 +1019,7 @@ mod json_parsing_tests {
             .from_json_value(json)
             .expect_err("should be an invalid uid field");
         match err {
-            EntitiesError::DeserializationError(err) => assert!(err
+            EntitiesError::Deserialization(err) => assert!(err
                 .to_string()
                 .contains("did not match any variant of untagged enum")),
             _ => panic!("expected deserialization error, got a different error: {err}"),
@@ -568,7 +1038,7 @@ mod json_parsing_tests {
             .from_json_value(json)
             .expect_err("should be an invalid parents field");
         match err {
-            EntitiesError::DeserializationError(err) => {
+            EntitiesError::Deserialization(err) => {
                 assert!(err.to_string().contains("invalid type: string"))
             }
             _ => panic!("expected deserialization error, got a different error: {err}"),
@@ -590,7 +1060,7 @@ mod json_parsing_tests {
             .from_json_value(json)
             .expect_err("should be an invalid parents field");
         match err {
-            EntitiesError::DeserializationError(err) => assert!(err
+            EntitiesError::Deserialization(err) => assert!(err
                 .to_string()
                 .contains("did not match any variant of untagged enum")),
             _ => panic!("expected deserialization error, got a different error: {err}"),
@@ -639,7 +1109,7 @@ mod json_parsing_tests {
             [
                 ("foo".into(), RestrictedExpr::val(false)),
                 ("bar".into(), RestrictedExpr::val(-234)),
-                ("ham".into(), RestrictedExpr::val(r#"a b c * / ? \"#)),
+                ("ham".into(), RestrictedExpr::val(r"a b c * / ? \")),
                 (
                     "123".into(),
                     RestrictedExpr::val(EntityUID::with_eid("mom")),
@@ -720,7 +1190,7 @@ mod json_parsing_tests {
         .expect("Failed to construct entities");
         assert!(matches!(
             roundtrip(&entities),
-            Err(EntitiesError::SerializationError(JsonSerializationError::ReservedKey { key })) if key.as_str() == "__entity"
+            Err(EntitiesError::Serialization(JsonSerializationError::ReservedKey { key })) if key.as_str() == "__entity"
         ));
     }
 
@@ -744,7 +1214,9 @@ mod json_parsing_tests {
             .from_json_value(json)
             .expect_err("should fail due to invalid action parent");
         assert!(
-            err.to_string().contains(r#"XYZ::Action::"view" is an action, so it should not have a parent User::"alice", which is not an action"#),
+            err.to_string().contains(
+                r#"action `XYZ::Action::"view"` has a non-action parent `User::"alice"`"#
+            ),
             "actual error message was {}",
             err
         );
@@ -960,6 +1432,7 @@ mod schema_based_parsing_tests {
         }
     }
 
+    #[cfg(feature = "ipaddr")]
     /// JSON that should parse differently with and without the above schema
     #[test]
     fn with_and_without_schema() {
@@ -1023,14 +1496,18 @@ mod schema_based_parsing_tests {
             .expect("hr_contacts attr should exist");
         assert!(matches!(hr_contacts.expr_kind(), &ExprKind::Set(_)));
         let contact = {
-            let ExprKind::Set(set) = hr_contacts.expr_kind() else { panic!("already checked it was Set") };
+            let ExprKind::Set(set) = hr_contacts.expr_kind() else {
+                panic!("already checked it was Set")
+            };
             set.iter().next().expect("should be at least one contact")
         };
         assert!(matches!(contact.expr_kind(), &ExprKind::Record { .. }));
         let json_blob = parsed
             .get("json_blob")
             .expect("json_blob attr should exist");
-        let ExprKind::Record { pairs } = json_blob.expr_kind() else { panic!("expected json_blob to be a Record") };
+        let ExprKind::Record { pairs } = json_blob.expr_kind() else {
+            panic!("expected json_blob to be a Record")
+        };
         let (_, inner1) = pairs
             .iter()
             .find(|(k, _)| k == "inner1")
@@ -1044,7 +1521,9 @@ mod schema_based_parsing_tests {
             .find(|(k, _)| k == "inner3")
             .expect("inner3 attr should exist");
         assert!(matches!(inner3.expr_kind(), &ExprKind::Record { .. }));
-        let ExprKind::Record { pairs: innerpairs } = inner3.expr_kind() else { panic!("already checked it was Record") };
+        let ExprKind::Record { pairs: innerpairs } = inner3.expr_kind() else {
+            panic!("already checked it was Record")
+        };
         let (_, innerinner) = innerpairs
             .iter()
             .find(|(k, _)| k == "innerinner")
@@ -1098,7 +1577,9 @@ mod schema_based_parsing_tests {
             .expect("hr_contacts attr should exist");
         assert!(matches!(hr_contacts.expr_kind(), &ExprKind::Set(_)));
         let contact = {
-            let ExprKind::Set(set) = hr_contacts.expr_kind() else { panic!("already checked it was Set") };
+            let ExprKind::Set(set) = hr_contacts.expr_kind() else {
+                panic!("already checked it was Set")
+            };
             set.iter().next().expect("should be at least one contact")
         };
         assert!(matches!(
@@ -1108,7 +1589,9 @@ mod schema_based_parsing_tests {
         let json_blob = parsed
             .get("json_blob")
             .expect("json_blob attr should exist");
-        let ExprKind::Record { pairs } = json_blob.expr_kind() else { panic!("expected json_blob to be a Record") };
+        let ExprKind::Record { pairs } = json_blob.expr_kind() else {
+            panic!("expected json_blob to be a Record")
+        };
         let (_, inner1) = pairs
             .iter()
             .find(|(k, _)| k == "inner1")
@@ -1122,7 +1605,9 @@ mod schema_based_parsing_tests {
             .find(|(k, _)| k == "inner3")
             .expect("inner3 attr should exist");
         assert!(matches!(inner3.expr_kind(), &ExprKind::Record { .. }));
-        let ExprKind::Record { pairs: innerpairs } = inner3.expr_kind() else { panic!("already checked it was Record") };
+        let ExprKind::Record { pairs: innerpairs } = inner3.expr_kind() else {
+            panic!("already checked it was Record")
+        };
         let (_, innerinner) = innerpairs
             .iter()
             .find(|(k, _)| k == "innerinner")
@@ -1154,6 +1639,7 @@ mod schema_based_parsing_tests {
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// simple type mismatch with expected type
     #[test]
     fn type_mismatch_string_long() {
@@ -1193,12 +1679,13 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to type mismatch on numDirectReports");
         assert!(
-            err.to_string().contains(r#"In attribute "numDirectReports" on Employee::"12UA45", type mismatch: attribute was expected to have type long, but actually has type string"#),
+            err.to_string().contains(r#"in attribute `numDirectReports` on `Employee::"12UA45"`, type mismatch: attribute was expected to have type long, but actually has type string"#),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// another simple type mismatch with expected type
     #[test]
     fn type_mismatch_entity_record() {
@@ -1239,12 +1726,13 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to type mismatch on manager");
         assert!(
             err.to_string()
-                .contains(r#"In attribute "manager" on Employee::"12UA45", expected a literal entity reference, but got "34FB87""#),
+                .contains(r#"in attribute `manager` on `Employee::"12UA45"`, expected a literal entity reference, but got `"34FB87"`"#),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// type mismatch where we expect a set and get just a single element
     #[test]
     fn type_mismatch_set_element() {
@@ -1281,12 +1769,13 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to type mismatch on hr_contacts");
         assert!(
-            err.to_string().contains(r#"In attribute "hr_contacts" on Employee::"12UA45", type mismatch: attribute was expected to have type (set of (entity of type HR)), but actually has type record"#),
+            err.to_string().contains(r#"in attribute `hr_contacts` on `Employee::"12UA45"`, type mismatch: attribute was expected to have type (set of (entity of type `HR`)), but actually has type record"#),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// type mismatch where we just get the wrong entity type
     #[test]
     fn type_mismatch_entity_types() {
@@ -1326,12 +1815,13 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to type mismatch on manager");
         assert!(
-            err.to_string().contains(r#"In attribute "manager" on Employee::"12UA45", type mismatch: attribute was expected to have type (entity of type Employee), but actually has type (entity of type HR)"#),
+            err.to_string().contains(r#"in attribute `manager` on `Employee::"12UA45"`, type mismatch: attribute was expected to have type (entity of type `Employee`), but actually has type (entity of type `HR`)"#),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// type mismatch where we're expecting an extension type and get a
     /// different extension type
     #[test]
@@ -1372,12 +1862,13 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to type mismatch on home_ip");
         assert!(
-            err.to_string().contains(r#"In attribute "home_ip" on Employee::"12UA45", type mismatch: attribute was expected to have type ipaddr, but actually has type decimal"#),
+            err.to_string().contains(r#"in attribute `home_ip` on `Employee::"12UA45"`, type mismatch: attribute was expected to have type ipaddr, but actually has type decimal"#),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     #[test]
     fn missing_record_attr() {
         // missing a record attribute entirely
@@ -1416,12 +1907,13 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to missing attribute \"inner2\"");
         assert!(
-            err.to_string().contains(r#"In attribute "json_blob" on Employee::"12UA45", expected the record to have an attribute "inner2", but it didn't"#),
+            err.to_string().contains(r#"in attribute `json_blob` on `Employee::"12UA45"`, expected the record to have an attribute `inner2`, but it does not"#),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// record attribute has the wrong type
     #[test]
     fn type_mismatch_in_record_attr() {
@@ -1461,7 +1953,7 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to type mismatch on attribute \"inner1\"");
         assert!(
-            err.to_string().contains(r#"In attribute "json_blob" on Employee::"12UA45", type mismatch: attribute was expected to have type record with attributes: "#),
+            err.to_string().contains(r#"in attribute `json_blob` on `Employee::"12UA45"`, type mismatch: attribute was expected to have type record with attributes: "#),
             "actual error message was {}",
             err
         );
@@ -1498,6 +1990,7 @@ mod schema_based_parsing_tests {
             .expect("this version with explicit __entity and __extn escapes should also pass");
     }
 
+    #[cfg(feature = "ipaddr")]
     /// unexpected record attribute
     #[test]
     fn unexpected_record_attr() {
@@ -1538,7 +2031,7 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to unexpected attribute \"inner4\"");
         assert!(
-            err.to_string().contains(r#"In attribute "json_blob" on Employee::"12UA45", record attribute "inner4" shouldn't exist"#),
+            err.to_string().contains(r#"in attribute `json_blob` on `Employee::"12UA45"`, record attribute `inner4` should not exist"#),
             "actual error message was {}",
             err
         );
@@ -1582,12 +2075,13 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to missing attribute \"numDirectReports\"");
         assert!(
-            err.to_string().contains(r#"Expected Employee::"12UA45" to have an attribute "numDirectReports", but it didn't"#),
+            err.to_string().contains(r#"expected entity `Employee::"12UA45"` to have an attribute `numDirectReports`, but it does not"#),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// unexpected entity attribute
     #[test]
     fn unexpected_entity_attr() {
@@ -1629,13 +2123,14 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to unexpected attribute \"wat\"");
         assert!(
             err.to_string().contains(
-                r#"Attribute "wat" on Employee::"12UA45" shouldn't exist according to the schema"#
+                r#"attribute `wat` on `Employee::"12UA45"` should not exist according to the schema"#
             ),
             "actual error message was {}",
             err
         );
     }
 
+    #[cfg(feature = "ipaddr")]
     /// Test that involves parents of wrong types
     #[test]
     fn parents_wrong_type() {
@@ -1678,7 +2173,7 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to incorrect parent type");
         assert!(
             err.to_string().contains(
-                r#"Employee::"12UA45" is not allowed to have a parent of type Employee according to the schema"#
+                r#"`Employee::"12UA45"` is not allowed to have a parent of type `Employee` according to the schema"#
             ),
             "actual error message was {}",
             err
@@ -1706,8 +2201,9 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to undeclared entity type");
         assert!(
-            err.to_string()
-                .contains(r#"CEO::"abcdef" has type CEO which is not declared in the schema"#),
+            err.to_string().contains(
+                r#"entity `CEO::"abcdef"` has type `CEO` which is not declared in the schema"#
+            ),
             "actual error message was {}",
             err
         );
@@ -1735,7 +2231,7 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to undeclared action");
         assert!(
             err.to_string().contains(
-                r#"Found entity data for Action::"update", but it was not declared as an action in the schema"#
+                r#"found action entity `Action::"update"`, but it was not declared as an action in the schema"#
             ),
             "actual error message was {}",
             err
@@ -1801,7 +2297,7 @@ mod schema_based_parsing_tests {
         );
         assert!(
             err.to_string().contains(
-                r#"Definition of Action::"view" does not match the schema's declaration of that action"#
+                r#"definition of action `Action::"view"` does not match its schema declaration"#
             ),
             "actual error message was {}",
             err
@@ -1834,7 +2330,7 @@ mod schema_based_parsing_tests {
         );
         assert!(
             err.to_string().contains(
-                r#"Definition of Action::"view" does not match the schema's declaration of that action"#
+                r#"definition of action `Action::"view"` does not match its schema declaration"#
             ),
             "actual error message was {}",
             err
@@ -1865,7 +2361,7 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to action attribute missing in json");
         assert!(
             err.to_string().contains(
-                r#"Definition of Action::"view" does not match the schema's declaration of that action"#
+                r#"definition of action `Action::"view"` does not match its schema declaration"#
             ),
             "actual error message was {}",
             err
@@ -1899,7 +2395,7 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to action attribute missing in schema");
         assert!(
             err.to_string().contains(
-                r#"Definition of Action::"view" does not match the schema's declaration of that action"#
+                r#"definition of action `Action::"view"` does not match its schema declaration"#
             ),
             "actual error message was {}",
             err
@@ -1930,7 +2426,7 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to action parent missing in json");
         assert!(
             err.to_string().contains(
-                r#"Definition of Action::"view" does not match the schema's declaration of that action"#
+                r#"definition of action `Action::"view"` does not match its schema declaration"#
             ),
             "actual error message was {}",
             err
@@ -1964,7 +2460,7 @@ mod schema_based_parsing_tests {
             .expect_err("should fail due to action parent missing in schema");
         assert!(
             err.to_string().contains(
-                r#"Definition of Action::"view" does not match the schema's declaration of that action"#
+                r#"definition of action `Action::"view"` does not match its schema declaration"#
             ),
             "actual error message was {}",
             err
@@ -2102,7 +2598,7 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to manager being wrong entity type (missing namespace)");
         assert!(
-            err.to_string().contains(r#"In attribute "manager" on XYZCorp::Employee::"12UA45", type mismatch: attribute was expected to have type (entity of type XYZCorp::Employee), but actually has type (entity of type Employee)"#),
+            err.to_string().contains(r#"in attribute `manager` on `XYZCorp::Employee::"12UA45"`, type mismatch: attribute was expected to have type (entity of type `XYZCorp::Employee`), but actually has type (entity of type `Employee`)"#),
             "actual error message was {}",
             err
         );
@@ -2125,7 +2621,7 @@ mod schema_based_parsing_tests {
             .from_json_value(entitiesjson)
             .expect_err("should fail due to employee being wrong entity type (missing namespace)");
         assert!(
-            err.to_string().contains(r#"Employee::"12UA45" has type Employee which is not declared in the schema; did you mean XYZCorp::Employee?"#),
+            err.to_string().contains(r#"`Employee::"12UA45"` has type `Employee` which is not declared in the schema. Did you mean `XYZCorp::Employee`?"#),
             "actual error message was {}",
             err
         );

@@ -45,11 +45,11 @@ pub struct EntityJSON {
 #[derive(Debug, Clone)]
 pub struct EntityJsonParser<'e, S: Schema = NoEntitiesSchema> {
     /// If a `schema` is present, this will inform the parsing: for instance, it
-    /// will allow `__entity` and `__extn` escapes to be implicit, and it will error
-    /// if attributes have the wrong types (e.g., string instead of integer).
-    /// That does not mean it will fully enforce that the produced `Entities`
-    /// conform to the `schema` -- for instance, as of this writing, it will not
-    /// error for unexpected (additional) record attributes.
+    /// will allow `__entity` and `__extn` escapes to be implicit.
+    /// It will also ensure that the produced `Entities` fully conforms to the
+    /// `schema` -- for instance, it will error if attributes have the wrong
+    /// types (e.g., string instead of integer), or if required attributes are
+    /// missing or superfluous attributes are provided.
     schema: Option<S>,
 
     /// Extensions which are active for the JSON parsing.
@@ -75,12 +75,12 @@ enum EntitySchemaInfo<E: EntityTypeDescription> {
 impl<'e, S: Schema> EntityJsonParser<'e, S> {
     /// Create a new `EntityJsonParser`.
     ///
-    /// If a `schema` is provided, this will inform the parsing: for instance, it
-    /// will allow `__entity` and `__extn` escapes to be implicit, and it will error
-    /// if attributes have the wrong types (e.g., string instead of integer).
-    /// That does not mean it will fully enforce that the produced `Entities`
-    /// conform to the `schema` -- for instance, as of this writing, it will not
-    /// error for unexpected (additional) record attributes.
+    /// If a `schema` is present, this will inform the parsing: for instance, it
+    /// will allow `__entity` and `__extn` escapes to be implicit.
+    /// It will also ensure that the produced `Entities` fully conforms to the
+    /// `schema` -- for instance, it will error if attributes have the wrong
+    /// types (e.g., string instead of integer), or if required attributes are
+    /// missing or superfluous attributes are provided.
     ///
     /// If you pass `TCComputation::AssumeAlreadyComputed`, then the caller is
     /// responsible for ensuring that TC holds before calling this method.
@@ -96,28 +96,64 @@ impl<'e, S: Schema> EntityJsonParser<'e, S> {
         }
     }
 
-    /// Parse an entities JSON file (in `&str` form) into an `Entities` object
+    /// Parse an entities JSON file (in [`&str`] form) into an [`Entities`] object
     pub fn from_json_str(&self, json: &str) -> Result<Entities, EntitiesError> {
         let ejsons: Vec<EntityJSON> =
             serde_json::from_str(json).map_err(JsonDeserializationError::from)?;
         self.parse_ejsons(ejsons)
     }
 
-    /// Parse an entities JSON file (in `serde_json::Value` form) into an `Entities` object
+    /// Parse an entities JSON file (in [`serde_json::Value`] form) into an [`Entities`] object
     pub fn from_json_value(&self, json: serde_json::Value) -> Result<Entities, EntitiesError> {
         let ejsons: Vec<EntityJSON> =
             serde_json::from_value(json).map_err(JsonDeserializationError::from)?;
         self.parse_ejsons(ejsons)
     }
 
-    /// Parse an entities JSON file (in `std::io::Read` form) into an `Entities` object
+    /// Parse an entities JSON file (in [`std::io::Read`] form) into an [`Entities`] object
     pub fn from_json_file(&self, json: impl std::io::Read) -> Result<Entities, EntitiesError> {
         let ejsons: Vec<EntityJSON> =
             serde_json::from_reader(json).map_err(JsonDeserializationError::from)?;
         self.parse_ejsons(ejsons)
     }
 
-    /// internal function that creates an `Entities` from a stream of `EntityJSON`
+    /// Parse an entities JSON file (in [`&str`] form) into an iterator over [`Entity`]s
+    pub fn iter_from_json_str(
+        &self,
+        json: &str,
+    ) -> Result<impl Iterator<Item = Result<Entity, EntitiesError>> + '_, EntitiesError> {
+        let ejsons: Vec<EntityJSON> =
+            serde_json::from_str(json).map_err(JsonDeserializationError::from)?;
+        Ok(ejsons
+            .into_iter()
+            .map(|ejson| self.parse_ejson(ejson).map_err(EntitiesError::from)))
+    }
+
+    /// Parse an entities JSON file (in [`serde_json::Value`] form) into an iterator over [`Entity`]s
+    pub fn iter_from_json_value(
+        &self,
+        json: serde_json::Value,
+    ) -> Result<impl Iterator<Item = Result<Entity, EntitiesError>> + '_, EntitiesError> {
+        let ejsons: Vec<EntityJSON> =
+            serde_json::from_value(json).map_err(JsonDeserializationError::from)?;
+        Ok(ejsons
+            .into_iter()
+            .map(|ejson| self.parse_ejson(ejson).map_err(EntitiesError::from)))
+    }
+
+    /// Parse an entities JSON file (in [`std::io::Read`] form) into an iterator over  [`Entity`]s
+    pub fn iter_from_json_file(
+        &self,
+        json: impl std::io::Read,
+    ) -> Result<impl Iterator<Item = Result<Entity, EntitiesError>> + '_, EntitiesError> {
+        let ejsons: Vec<EntityJSON> =
+            serde_json::from_reader(json).map_err(JsonDeserializationError::from)?;
+        Ok(ejsons
+            .into_iter()
+            .map(|ejson| self.parse_ejson(ejson).map_err(EntitiesError::from)))
+    }
+
+    /// internal function that creates an [`Entities`] from a stream of [`EntityJSON`]
     fn parse_ejsons(
         &self,
         ejsons: impl IntoIterator<Item = EntityJSON>,
@@ -169,7 +205,7 @@ impl<'e, S: Schema> EntityJsonParser<'e, S> {
                 // here, we ensure that all the attributes on the schema's copy of the
                 // action do exist in `ejson.attrs`. Later when consuming `ejson.attrs`,
                 // we'll do the rest of the checks for attribute agreement.
-                for schema_attr in action.attrs().keys() {
+                for schema_attr in action.attrs_map().keys() {
                     if !ejson.attrs.contains_key(schema_attr) {
                         return Err(JsonDeserializationError::ActionDeclarationMismatch { uid });
                     }
@@ -297,7 +333,7 @@ impl<'e, S: Schema> EntityJsonParser<'e, S> {
                         if parent_euid.is_action() {
                             Ok(())
                         } else {
-                            Err(JsonDeserializationError::ActionParentIsNonAction {
+                            Err(JsonDeserializationError::ActionParentIsNotAction {
                                 uid: uid.clone(),
                                 parent: parent_euid.clone(),
                             })
@@ -372,13 +408,7 @@ impl EntityJSON {
             uid: EntityUidJSON::ImplicitEntityEscape(TypeAndId::from(entity.uid())),
             attrs: entity
                 .attrs()
-                .iter()
-                .map(|(k, expr)| {
-                    Ok((
-                        k.clone(),
-                        serde_json::to_value(JSONValue::from_expr(expr.as_borrowed())?)?,
-                    ))
-                })
+                .map(|(k, expr)| Ok((k.into(), serde_json::to_value(JSONValue::from_expr(expr)?)?)))
                 .collect::<Result<_, JsonSerializationError>>()?,
             parents: entity
                 .ancestors()

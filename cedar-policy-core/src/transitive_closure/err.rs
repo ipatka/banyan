@@ -22,12 +22,12 @@ use thiserror::Error;
 /// error type is parametrized by a type `K` which is the type of a unique
 /// identifier for graph nodes and the type returned by `get_key` on the
 /// `TCNode` trait.
-#[derive(Debug, Error)]
-pub enum Err<K: Debug + Display> {
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TcError<K: Debug + Display> {
     /// Error raised when `TCComputation::EnforceAlreadyComputed` finds that the
     /// TC was in fact not already computed
-    #[error("expected all transitive edges to exist, but they don't. {child} is a child of {parent} is a child of {grandparent}, but {grandparent} is not marked as an ancestor of {child}")]
-    TCEnforcementError {
+    #[error("expected all transitive edges to exist, but `{child}` -> `{parent}` and `{parent}` -> `{grandparent}` exists, while `{child}` -> `{grandparent}` does not")]
+    MissingTcEdge {
         /// Child entity at fault
         child: K,
         /// Parent entity at fault
@@ -37,7 +37,7 @@ pub enum Err<K: Debug + Display> {
         grandparent: K,
     },
     /// Error raised when enforce_dag finds that the graph is not a DAG
-    #[error("input graph has a cycle. Vertex {} has a loop.", .vertex_with_loop)]
+    #[error("input graph has a cycle containing vertex `{}`", .vertex_with_loop)]
     HasCycle {
         /// Because DAG enforcement can only be called after compute_tc/enforce_tc, a cycle will manifest as a vertex with a loop
         vertex_with_loop: K,
@@ -45,4 +45,4 @@ pub enum Err<K: Debug + Display> {
 }
 
 /// Type alias for convenience
-pub type Result<T, K> = std::result::Result<T, Err<K>>;
+pub type Result<T, K> = std::result::Result<T, TcError<K>>;
