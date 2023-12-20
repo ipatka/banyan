@@ -179,23 +179,76 @@ Any transaction context you'd like to reference can be found in your json reques
 ```
 
 **policies.cedar**
-```json
-@name("Base Permit")
-permit(
-		principal,
-		action,
-		resource
-);
 
-
-@name("Sanctions")
-@message("Block Sanctioned Addresses")
-@action("Block")
-@dependency("verified_addresses:1f033d2d-461a-4ce4-9026-5eb7efff5b4a")
+```js
+@name("Standard ERC20 TransferFrom Block Custom List")
+@dependency("shared_addresses:block_list")
+@message("Allow ERC20 transfer from unless blocked sender or recipient")
 forbid(
-		principal,
-		action,
-		resource
-) when {  resource has groups && resource.groups.contains(Group::"1f033d2d-461a-4ce4-9026-5eb7efff5b4a") };
-
+  principal,
+  action == Action::"0x23b872dd",
+  resource
+) when {
+  (((((context["args"])["arg_0"]) has "groups") && ((((context["args"])["arg_0"])["groups"]).contains(Group::"block_list"))) || ((((context["args"])["arg_1"]) has "groups") && ((((context["args"])["arg_1"])["groups"]).contains(Group::"block_list")))) || ((principal has "groups") && ((principal["groups"]).contains(Group::"block_list")))
+};
+@name("Standard ERC20 TransferFrom Block Custom List")
+@message("Allow ERC20 transfer from unless blocked sender or recipient")
+@dependency("shared_addresses:block_list")
+forbid(
+  principal,
+  action == Action::"0x23b872dd",
+  resource
+) when {
+  (((((context["args"])["arg_0"]) has "groups") && ((((context["args"])["arg_0"])["groups"]).contains(Group::"block_list"))) || ((((context["args"])["arg_1"]) has "groups") && ((((context["args"])["arg_1"])["groups"]).contains(Group::"block_list")))) || ((principal has "groups") && ((principal["groups"]).contains(Group::"block_list")))
+};
+@dependency("shared_addresses:block_list")
+@message("Allow transactions unless blocked sender or recipient or contract")
+@name("Address or Contract Block Custom List")
+permit(
+  principal,
+  action,
+  resource
+) when {
+  !(((resource has "groups") && ((resource["groups"]).contains(Group::"block_list"))) || ((principal has "groups") && ((principal["groups"]).contains(Group::"block_list"))))
+};
+@dependency("shared_addresses:block_list")
+@message("Allow ERC20 transfer unless blocked sender or recipient")
+@name("Standard ERC20 Transfer Block Custom List")
+forbid(
+  principal,
+  action == Action::"0xa9059cbb",
+  resource
+) when {
+  ((((context["args"])["arg_0"]) has "groups") && ((((context["args"])["arg_0"])["groups"]).contains(Group::"block_list"))) || ((principal has "groups") && ((principal["groups"]).contains(Group::"block_list")))
+};
+@name("Non-Standard ERC20 Approve Block Custom List")
+@message("Allow ERC20 approve unless blocked sender or recipient")
+@dependency("shared_addresses:block_list")
+forbid(
+  principal,
+  action == Action::"0x095ea7b3",
+  resource
+) when {
+  ((((context["args"])["arg_0"]) has "groups") && ((((context["args"])["arg_0"])["groups"]).contains(Group::"block_list"))) || ((principal has "groups") && ((principal["groups"]).contains(Group::"block_list")))
+};
+@name("Standard ERC20 Approve Block Custom List")
+@message("Allow ERC20 approve unless blocked sender or spender")
+@dependency("shared_addresses:block_list")
+forbid(
+  principal,
+  action == Action::"0x095ea7b3",
+  resource
+) when {
+  ((((context["args"])["arg_0"]) has "groups") && ((((context["args"])["arg_0"])["groups"]).contains(Group::"block_list"))) || ((principal has "groups") && ((principal["groups"]).contains(Group::"block_list")))
+};
+@name("Non-Standard ERC20 Transfer Block Custom List")
+@message("Allow ERC20 transfer unless blocked sender or recipient")
+@dependency("shared_addresses:block_list")
+forbid(
+  principal,
+  action == Action::"0xa9059cbb",
+  resource
+) when {
+  ((((context["args"])["arg_0"]) has "groups") && ((((context["args"])["arg_0"])["groups"]).contains(Group::"block_list"))) || ((principal has "groups") && ((principal["groups"]).contains(Group::"block_list")))
+};
 ```
