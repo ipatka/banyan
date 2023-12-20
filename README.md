@@ -8,7 +8,7 @@
 [![docs.rs](https://img.shields.io/docsrs/cedar-policy)](https://docs.rs/cedar-policy/latest/cedar_policy/)
 ![nightly](https://github.com/cedar-policy/cedar/actions/workflows/nightly_build.yml/badge.svg)
 
-This repository contains source code of the Rust crates that implement the [Cedar](https://www.cedarpolicy.com/) policy language.
+This repository contains source code of the Rust crates that implement the Banyan fork of the [Cedar](https://www.cedarpolicy.com/) policy language.
 
 Cedar is a language for writing and enforcing authorization policies in your applications. Using Cedar, you can write policies that specify your applications' fine-grained permissions. Your applications then authorize access requests by calling Cedar's authorization engine. Because Cedar policies are separate from application code, they can be independently authored, updated, analyzed, and audited. You can use Cedar's validator to check that Cedar policies are consistent with a declared schema which defines your application's authorization model.
 
@@ -20,101 +20,182 @@ Cedar is fast and scalable. The policy structure is designed to be indexed for q
 ### Analyzable
 Cedar is designed for analysis using Automated Reasoning. This enables analyzer tools capable of optimizing your policies and proving that your security model is what you believe it is.
 
-## Using Cedar
-Cedar can be used in your application by depending on the `cedar-policy` crate.
+Banyan is an extension of Cedar which adds Ethereum transaction context to enforce policies on the wallet or RPC  layer.
 
-Just add `cedar-policy` as a dependency in your `Cargo.toml`:
-```toml
-[dependencies]
-cedar-policy = "2.0"
+## All About Policies
+### Anatomy of a Policy
+#### Banyan Policy Language
+Banyan is an adaptation of [AWS' Cedar Policy Language (CPL)](https://github.com/ipatka/banyan). Banyan adapts CPL for use in EVM transaction permissioning. You can get a firm understanding on the [cedar policy language in this tutorial.](https://www.cedarpolicy.com/en/tutorial/policy-structure) A CPL policy statement is made up of the following:
+- The effect (forbid, permit)
+- The scope (principal, action, resource)
+- Conditions (unless, when)
+
+A cedar file can contain a series of policy statements. Once a series of policy statements are executed, it will result in either "ALLOW" or "DENY". By default, everything not explicitly permitted results in "DENY", but this can be changed. See ["Setting Base Authorization"](https://hackmd.io/pZQrj_7HTMeBGP2PKMDljA#Setting-Base-Authorization). In instances where policies are conflicting, they will also return "DENY". 
+
+Banyan makes use of decorators to extend the functionality of the Cedar Policy Language. A policy written in Banyan will follow the format in the example below.
+
+```rust!
+@name("Policy Statement 1 Name")
+@message("This is the message returned when this policy fulfills it's action.")
+@dependency("threatmodels.alerts")
+@action("MFA")
+permit(
+    principal,
+    action == 0xasldfakj,
+    resource
+) when {context.transaction.value.u256LessThan(u256("1234")) && threatmodels.alerts.time.u256LessThan(time.now()-time.hours(72))};
 ```
-## Crates in this workspace
+Contextual information is provided inside the json request.
 
-* [cedar-policy](./cedar-policy) : Main crate for using Cedar to authorize access requests in your applications, and validate Cedar policies against a schema
-* [cedar-policy-cli](./cedar-policy-cli) : Crate containing a simple command-line interface (CLI) for interacting with Cedar
-* [cedar-policy-core](./cedar-policy-core) : Internal crate containing the Cedar parser and evaluator
-* [cedar-policy-validator](./cedar-policy-validator) : Internal crate containing the Cedar validator
-* [cedar-policy-formatter](./cedar-policy-formatter) : Internal crate containing an auto-formatter for Cedar policies
-* [cedar-integration-tests](./cedar-integration-tests) : Crate containing integration tests
-
-## Quick Start
-
-Let's put the policy in policy.cedar and the entities in entities.json:
-
-policy.cedar
+#### Decorators
+##### *@name*
+This decorator is used to define and name a policy statement. This name will make an appearance in the Shield3 UI, messages sent to you regarding this policy, and can be used to reference the policy elsewhere.
+```rust 
+@name("Known phishing address")
 ```
-permit (
-  principal == User::"alice",
-  action == Action::"view",
-  resource in Album::"jane_vacation"
-);
-```
-This policy specifies that `alice` is allowed to view the photos in the `"jane_vacation"` album.
+##### *@message*
+When the policy statement triggers a message, the user will receive this message. The message decorator was designed to be used as a way of warning against potentially risky situations.
 
-entities.json
+```rust!
+@message("Your transaction was blocked because the receiver of the transfer is a known phishing scammer. Please be sure to verify addresses before sending.")
+```
+
+##### *@action*
+This is the action to carry out if the policy statement returns the relevant permission. The action can be defined as either Multi-Factor Authentication (MFA) or Notify. A DENY always results in block, however, ALLOW can result in either pass, notify, or MFA.
+
+###### Block vs. Pass
+Blocking means a transaction is not forwarded to the node service provider. If a transaction is blocked, a notification is sent to the transaction executor with the message defined in the *@message* decorator. If the transaction passes, then it is silently forwarded to the node service provider.
+
+
+
+###### MFA
+An MFA action is triggered when it's policy statement returns ALLOW. When MFA is triggered, the policy statement name, policy statement message, and transaction context will be sent to the transaction executor through their configured notifications, which can be found [here](url). 
+
+The executor will then have the option to allow or deny the transaction. As shown previously, it's a good idea to set the message decorator as a warning, describing the risks coming with approving the transaction.
+```rust
+@action("MFA")
+```
+
+###### NOTIFY
+When the notify action is triggered, the transaction will be broadcast as per usual, but notify the executor with the message provided from the message decorator.
+```rust
+@action("NOTIFY")
+```
+##### *@dependency*
+```rust
+@dependency("abcd-1234")
+```
+Any transaction context you'd like to reference can be found in your json request. Below is an example request, and a condition referencing it. In this case it returns a boolean to check if the network is mainnet ethereum. Any rich context you'd like to reference (information other than what is encoded in your transaction) must be defined as a dependency using the *@dependency* decorator. This rich context is then found in *entities.json*.
+
+**request.json**
+```json
+{
+  "principal": "Address::\"0xcfcdec1645234f521f29cb2bb0d57a539ba3bfae\"",
+  "action": "Action::\"eoa\"",
+  "resource": "Address::\"0x7c3250001bc0abeeef91f52e9054a9f951190132\"",
+  "context": {
+    "transaction": {
+      "network": {
+        "__entity": {
+          "type": "Network",
+          "id": "0x01"
+        }
+      },
+      "data": "0x",
+      "value": {
+        "__expr": "u256(\"740048210\")"
+      },
+      "gasLimit": {
+        "__expr": "u256(\"500000\")"
+      }
+    }
+  }
+}
+```
+**entities.json**
 ```json
 [
-    {
-        "uid": { "type": "User", "id": "alice"} ,
-        "attrs": {"age": 18},
-        "parents": []
+  {
+    "uid": {
+      "type": "Address",
+      "id": "0xd8a53b315823d8f8df8cb438c13ebe08af7c9ca9"
     },
-    {
-        "uid": { "type": "Photo", "id": "VacationPhoto94.jpg"},
-        "attrs": {},
-        "parents": [{ "type": "Album", "id": "jane_vacation" }]
-    }
+    "attrs": {},
+    "parents": []
+  },
+  {
+    "uid": {
+      "type": "Address",
+      "id": "0x7a59293fe5fc36fdd762b4daeb07ba0873a3de44"
+    },
+    "attrs": {
+      "groups": [
+        {
+          "__entity": {
+            "type": "Group",
+            "id": "1f033d2d-461a-4ce4-9026-5eb7efff5b4a"
+          }
+        }
+      ]
+    },
+    "parents": []
+  },
+  {
+    "uid": {
+      "type": "Address",
+      "id": "0xcfcdec1645234f521f29cb2bb0d57a539ba3bfae"
+    },
+    "attrs": {},
+    "parents": []
+  },
+  {
+    "uid": {
+      "type": "Address",
+      "id": "0x7c3250001bc0abeeef91f52e9054a9f951190132"
+    },
+    "attrs": {},
+    "parents": []
+  },
+  {
+    "uid": {
+      "type": "Group",
+      "id": "1f033d2d-461a-4ce4-9026-5eb7efff5b4a"
+    },
+    "attrs": {},
+    "parents": []
+  },
+  {
+    "uid": {
+      "type": "Network",
+      "id": "0x01"
+    },
+    "attrs": {
+      "blockNumber": 18372931
+    },
+    "parents": []
+  }
 ]
 
 ```
-Cedar represents principals, resources, and actions as entities. An entity has a type (e.g., `User`) and an id (e.g., `alice`). They can also have attributes (e.g., `User::"alice"`'s `age` attribute is the integer `18`).
 
-Now, let's test our policy with the CLI
-```rust
- cargo run authorize \
-    --policies policy.cedar \
-    --entities entities.json \
-    --principal 'User::"alice"' \
-    --action 'Action::"view"' \
-    --resource 'Photo::"VacationPhoto94.jpg"'
+**policies.cedar**
+```json
+@name("Base Permit")
+permit(
+		principal,
+		action,
+		resource
+);
+
+
+@name("Sanctions")
+@message("Block Sanctioned Addresses")
+@action("Block")
+@dependency("verified_addresses:1f033d2d-461a-4ce4-9026-5eb7efff5b4a")
+forbid(
+		principal,
+		action,
+		resource
+) when {  resource has groups && resource.groups.contains(Group::"1f033d2d-461a-4ce4-9026-5eb7efff5b4a") };
+
 ```
-
-CLI output:
-```
-ALLOW
-```
-It is allowed because `VacationPhoto94.jpg` belongs to `Album::"jane_vacation"`, and `alice` can view photos in `Album::"jane_vacation"`.
-
-If you'd like to see more details on what can be expressed as Cedar policies, see the [documentation](https://docs.cedarpolicy.com/what-is-cedar.html).
-
-Examples of how to use Cedar in an application are contained in the repository [cedar-examples](https://github.com/cedar-policy/cedar-examples). [TinyTodo](https://github.com/cedar-policy/cedar-examples/tree/main/tinytodo) is a simple task list management app whose users' requests, sent as HTTP messages, are authorized by Cedar. It shows how you can integrate Cedar into your own Rust program.
-
-## Documentation
-
-General documentation for Cedar is available at [docs.cedarpolicy.com](https://docs.cedarpolicy.com), with docs source code in the [cedar-policy/cedar-docs](https://github.com/cedar-policy/cedar-docs/) repository.
-
-Generated documentation for the latest version of the Rust crates can be accessed
-[on docs.rs](https://docs.rs/cedar-policy).
-
-## Building
-
-To build, simply run `cargo build` (or `cargo build --release`).
-
-## What's new / Changelog
-
-We maintain changelogs for our public-facing crates: [cedar-policy](./cedar-policy/CHANGELOG.md) and [cedar-policy-cli](./cedar-policy-cli/CHANGELOG.md).
-For a list of the current and past releases, see [crates.io](https://crates.io/crates/cedar-policy) or [Releases](https://github.com/cedar-policy/cedar/releases).
-
-## Security
-
-See [SECURITY](SECURITY.md) for more information.
-
-## Attribution
-
-Banyan is based on a fork of [Cedar](https://github.com/cedar-policy/cedar)
-
-![Cedar Logo](./logo.svg)
-
-## License
-
-This project is licensed under the Apache-2.0 License.
